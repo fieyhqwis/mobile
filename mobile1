@@ -1,7 +1,8 @@
 -- ==========================================
--- HARDCOK MOBILE v3 — Chams + Aimbot
--- v3 fixes: no aim when no target in cone, no fight with game camera,
--- no aim when target is behind you, snap-only mode for cleanest behavior
+-- HARDCOK MOBILE v4 — Chams + Aimbot
+-- v4: zero direct camera writes when target is off-axis.
+-- Uses mousemoverel on PC; on mobile, only aims when target is
+-- within MaxAimAngle degrees of crosshair (no fight with the game camera).
 -- ==========================================
 
 local Players          = game:GetService("Players")
@@ -13,6 +14,8 @@ local StarterGui       = game:GetService("StarterGui")
 local LocalPlayer = Players.LocalPlayer
 local Camera      = Workspace.CurrentCamera
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 
 -- ------------------------------------------
 -- SETTINGS
@@ -29,20 +32,11 @@ local Settings = {
     ChamsEnemiesOnly = true,
     ChamsMaxDist     = 1500,
 
-    -- NEW: cone filter — only aim at targets within this many degrees
-    -- of where you're ALREADY looking. Set to 180 for "anywhere in front",
-    -- 90 for "in front of you", 0 to disable.
-    -- This is the main fix for "camera shakes with no target visible".
-    AimCone          = 90,
-
-    -- NEW: hard cap on snap distance per frame (in degrees).
-    -- Lower = less fighting with the game camera. 0 = no snap (disabled).
-    -- Default 5° = a clean small movement, no jitter.
-    MaxSnapAngle     = 5,
-
-    -- NEW: require the target to be visible AND in front of you AND
-    -- pass the cone test, all of the above. If any fails, do NOTHING.
-    StrictTargeting  = true,
+    -- The single most important setting. Only aim at targets within
+    -- MaxAimAngle degrees of the crosshair. Default 25° = "roughly in front"
+    -- Set to 5° for very strict (you basically have to be aimed at them).
+    -- Set to 180° for "anywhere, including behind" (will cause shake).
+    MaxAimAngle      = 25,
 }
 
 -- ------------------------------------------
@@ -142,55 +136,65 @@ end
 
 -- ------------------------------------------
 -- TARGETING
+-- Pick the target whose Head is closest to the crosshair in screen-space.
+-- This is WAY more accurate than "closest 3D distance" for aimbot purposes
+-- because what you see is what you aim at. A target 5m in front of you
+-- but off to the side is less likely to be hit than a target 50m away
+-- that's directly in front of you.
 -- ------------------------------------------
-local function getValidTargets()
-    local t = {}
-    for _, p in ipairs(Players:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character and isEnemy(p) then
-            t[#t + 1] = p.Character
+local function getOnScreenTarget()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local mousePos = UserInputService:GetMouseLocation()
+    local viewport = cam.ViewportSize
+    local best, bestDist = nil, math.huge
+    for _, char in ipairs(Players:GetPlayers()) do
+        if char ~= LocalPlayer and char.Character and isEnemy(char) then
+            local hum = char.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local part = getTargetPart(char.Character)
+                if part then
+                    if isVisible(part, char.Character, Settings.WallCheck) then
+                        local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+                        if onScreen then
+                            local dx = sp.X - mousePos.X
+                            local dy = sp.Y - mousePos.Y
+                            local screenDist = math.sqrt(dx * dx + dy * dy)
+                            if screenDist < bestDist then
+                                bestDist = screenDist
+                                best = part
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
     if Settings.NPCCheck then
         for _, npc in ipairs(cachedNPCs) do
-            if npc and npc.Parent then t[#t + 1] = npc end
-        end
-    end
-    return t
-end
-
--- Returns the best target, OR nil. "Best" = closest valid target.
--- The caller is responsible for the cone check and the snap itself,
--- so we can return a target even if it's behind you and let the caller decide.
-local function getBestTarget()
-    local cam = Workspace.CurrentCamera
-    if not cam then return nil end
-    local myPos = cam.CFrame.Position
-    local best, bestScore = nil, math.huge
-    for _, char in ipairs(getValidTargets()) do
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum and hum.Health > 0 then
-            local part = getTargetPart(char)
-            if part then
-                if isVisible(part, char, Settings.WallCheck) then
-                    local score = (part.Position - myPos).Magnitude
-                    if score < bestScore then bestScore, best = score, part end
+            if npc and npc.Parent then
+                local hum = npc:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    local part = getTargetPart(npc)
+                    if part then
+                        if isVisible(part, npc, Settings.WallCheck) then
+                            local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+                            if onScreen then
+                                local dx = sp.X - mousePos.X
+                                local dy = sp.Y - mousePos.Y
+                                local screenDist = math.sqrt(dx * dx + dy * dy)
+                                if screenDist < bestDist then
+                                    bestDist = screenDist
+                                    best = part
+                                end
+                            end
+                        end
+                    end
                 end
             end
         end
     end
     return best
-end
-
--- Angle (in degrees) between the camera's forward vector and the vector
--- to a world point. 0 = dead-on, 180 = directly behind. Negative never.
-local function angleToPoint(worldPos)
-    local cam = Workspace.CurrentCamera
-    if not cam then return 180 end
-    local to = worldPos - cam.CFrame.Position
-    local m = to.Magnitude
-    if m < 0.001 then return 0 end
-    local dot = cam.CFrame.LookVector:Dot(to / m)
-    return math.deg(math.acos(math.clamp(dot, -1, 1)))
 end
 
 -- ------------------------------------------
@@ -296,46 +300,67 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 -- ------------------------------------------
--- AIMBOT (v3: no fight with the game)
--- Three rules that fix the shake:
---   1) Cone filter: if AimCone > 0, only aim at targets within AimCone degrees
---      of the current look direction. Default 90° = "in front of you".
---   2) No behind-the-back: skip if the target is > 90° off (we already test this with cone).
---   3) Cap snap distance: if MaxSnapAngle is small, the camera moves a small amount
---      per frame, which the game absorbs without fighting back.
+-- AIMBOT (v4: no fight with the game)
+-- Two paths, picked at load:
+--   PC:    mousemoverel (the game's input system absorbs the delta)
+--   MOBILE: ONLY aim if target is within MaxAimAngle degrees of crosshair,
+--           and only do a SOFT lerp (alpha derived from angle, capped at 0.4).
+--           This is the absolute cleanest way to avoid camera shake on
+--           custom-camera games on mobile.
 -- ------------------------------------------
 RunService.RenderStepped:Connect(function()
     Camera = Workspace.CurrentCamera or Camera
 
     local wantAim = Settings.AimbotEnabled and (not Settings.HoldToAim or isRMBHeld)
     if wantAim then
-        local target = getBestTarget()
+        local target = getOnScreenTarget()
         if target then
-            -- Cone check: skip if target is outside the cone
-            local angle = angleToPoint(target.Position)
-            if Settings.AimCone <= 0 or angle <= Settings.AimCone then
-                local camPos = Camera.CFrame.Position
-                local toTarget = target.Position - camPos
-                local mag = toTarget.Magnitude
-                if mag > 0.05 and math.abs(toTarget.Unit.Y) < 0.995 then
-                    local goal = CFrame.new(camPos, target.Position)
-                    if goal.Position.X == goal.Position.X then -- NaN guard
-                        if Settings.MaxSnapAngle <= 0 then
-                            -- Disabled: do nothing
-                        elseif Settings.Mode == "Rage" then
-                            -- Clamp the lerp alpha so the per-frame rotation <= MaxSnapAngle
-                            local t = math.clamp(Settings.MaxSnapAngle / 45, 0.05, 1)
-                            Camera.CFrame = Camera.CFrame:Lerp(goal, t)
+            local cam = Workspace.CurrentCamera
+            if cam then
+                local mousePos = UserInputService:GetMouseLocation()
+                local sp, onScreen = cam:WorldToViewportPoint(target.Position)
+                if onScreen then
+                    local dx = sp.X - mousePos.X
+                    local dy = sp.Y - mousePos.Y
+                    local screenDist = math.sqrt(dx * dx + dy * dy)
+
+                    -- Estimate the angle from crosshair to target.
+                    -- Heuristic: at default FOV, viewport width = 2*tan(fov/2)*distance.
+                    -- For simplicity, we use screenDist / (viewport/2) as a proxy
+                    -- for "fraction of half-screen away", and convert.
+                    local fovRad = math.rad(cam.FieldOfView)
+                    local pixelsPerRad = (cam.ViewportSize.Y / 2) / math.tan(fovRad / 2)
+                    local angleDeg = math.deg(screenDist / pixelsPerRad)
+
+                    if angleDeg <= Settings.MaxAimAngle then
+                        if not IS_MOBILE and mousemoverel then
+                            -- PC path: feed delta to the game's input pipeline
+                            local strength = (Settings.Mode == "Rage") and 1.0 or 0.35
+                            local maxStep = (Settings.Mode == "Rage") and 60 or 25
+                            local mx = math.clamp(dx * strength, -maxStep, maxStep)
+                            local my = math.clamp(dy * strength, -maxStep, maxStep)
+                            if math.abs(mx) > 0.1 or math.abs(my) > 0.1 then
+                                pcall(mousemoverel, mx, my)
+                            end
                         else
-                            -- Light: smooth with same cap
-                            local t = math.clamp(Settings.MaxSnapAngle / 90, 0.02, 0.4)
-                            Camera.CFrame = Camera.CFrame:Lerp(goal, t)
+                            -- Mobile path: SOFT lerp, alpha tied to distance-to-target.
+                            -- Target close to crosshair = small alpha = minimal visible movement.
+                            -- Target at edge of cone = larger alpha = still capped movement.
+                            local t = math.clamp((Settings.MaxAimAngle - angleDeg) / Settings.MaxAimAngle, 0.02, 0.4)
+                            local camPos = cam.CFrame.Position
+                            local toTarget = target.Position - camPos
+                            if toTarget.Magnitude > 0.05 and math.abs(toTarget.Unit.Y) < 0.995 then
+                                local goal = CFrame.new(camPos, target.Position)
+                                if goal.Position.X == goal.Position.X then
+                                    cam.CFrame = cam.CFrame:Lerp(goal, t)
+                                end
+                            end
                         end
                     end
                 end
             end
         end
-        -- If no valid target, do NOTHING. The game camera is left alone.
+        -- If no target in cone, do NOTHING. Camera left alone.
     end
 
     local chamsSet = computeChamsSet()
@@ -348,7 +373,7 @@ RunService.RenderStepped:Connect(function()
 end)
 
 -- ------------------------------------------
--- TOUCH-FRIENDLY GUI (same as v2)
+-- GUI (same as v3)
 -- ==========================================
 local function make(class, props, parent)
     local i = Instance.new(class)
@@ -375,14 +400,43 @@ local fab = make("TextButton", {
     BackgroundColor3 = Color3.fromRGB(20, 20, 25),
     BackgroundTransparency = 0.15,
     BorderSizePixel  = 0,
-    Size             = UDim2.fromOffset(56, 56),
-    Position         = UDim2.new(0, 16, 0.5, -28),
+    Size             = UDim2.fromOffset(64, 64),
+    Position         = UDim2.new(0, 16, 1, -80),
     AutoButtonColor  = false,
+    Active           = true,
 }, gui)
 make("UICorner", { CornerRadius = UDim.new(1, 0) }, fab)
 make("UIStroke", { Thickness = 2, Color = Color3.fromRGB(120, 170, 255) }, fab)
 
+-- Cross-platform button press handler.
+-- Works for both PC (MouseButton1) and mobile (Touch).
+local function bindButtonPress(btn, onPress)
+    local pressed, startPos = false, nil
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            pressed  = true
+            startPos = Vector2.new(input.Position.X, input.Position.Y)
+        end
+    end)
+    btn.InputEnded:Connect(function(input)
+        if not pressed then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            pressed = false
+            local endPos = Vector2.new(input.Position.X, input.Position.Y)
+            if (endPos - startPos).Magnitude < 12 then
+                onPress()
+            end
+        end
+    end)
+end
+
+-- FAB: drag to move, tap to open panel
 do
+    bindButtonPress(fab, function()
+        panel.Visible = not panel.Visible
+    end)
     local dragging, dragStart, startPos
     fab.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -390,17 +444,6 @@ do
             dragging  = true
             dragStart = Vector2.new(input.Position.X, input.Position.Y)
             startPos  = fab.Position
-        end
-    end)
-    fab.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            if dragging then
-                dragging = false
-                if (dragStart - Vector2.new(input.Position.X, input.Position.Y)).Magnitude < 8 then
-                    panel.Visible = not panel.Visible
-                end
-            end
         end
     end)
     UserInputService.InputChanged:Connect(function(input)
@@ -412,6 +455,12 @@ do
             startPos.X.Scale, startPos.X.Offset + d.X,
             startPos.Y.Scale, startPos.Y.Offset + d.Y
         )
+    end)
+    fab.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
     end)
 end
 
@@ -430,7 +479,7 @@ make("UIStroke", { Color = Color3.fromRGB(80, 80, 100), Thickness = 1.5 }, panel
 
 make("TextLabel", {
     Name             = "Title",
-    Text             = "Hardcok Mobile v3",
+    Text             = "Hardcok Mobile v4",
     Font             = Enum.Font.GothamBold,
     TextSize         = 18,
     TextColor3       = Color3.fromRGB(255, 255, 255),
@@ -473,8 +522,7 @@ local function makeToggle(parent, y, label, default, onChange)
         btn.BackgroundColor3 = state and Color3.fromRGB(60, 160, 90) or Color3.fromRGB(120, 60, 60)
         if onChange then onChange(state) end
     end
-    btn.MouseButton1Click:Connect(flip)
-    btn.TouchTap:Connect(flip)
+    bindButtonPress(btn, flip)
     return btn
 end
 
@@ -511,12 +559,11 @@ local function makeCycle(parent, y, label, options, default, onChange)
         btn.Text = options[idx]
         if onChange then onChange(options[idx]) end
     end
-    btn.MouseButton1Click:Connect(cycle)
-    btn.TouchTap:Connect(cycle)
+    bindButtonPress(btn, cycle)
     return btn
 end
 
-makeToggle(panel, 50, "Aimbot", Settings.AimbotEnabled, function(v)
+local aimBtn = makeToggle(panel, 50, "Aimbot", Settings.AimbotEnabled, function(v)
     Settings.AimbotEnabled = v
 end)
 makeToggle(panel, 96, "Hold RMB to Aim", Settings.HoldToAim, function(v)
@@ -534,9 +581,10 @@ end)
 makeToggle(panel, 280, "Chams", Settings.ESPMode == "Chams", function(v)
     Settings.ESPMode = v and "Chams" or "Disabled"
 end)
-makeToggle(panel, 326, "Strict (no behind-you)", Settings.StrictTargeting, function(v)
-    Settings.StrictTargeting = v
-    if v then Settings.AimCone = 90 end
+makeCycle(panel, 326, "Aim Cone",  { "Tight", "Medium", "Wide" }, "Medium", function(v)
+    if v == "Tight" then Settings.MaxAimAngle = 10
+    elseif v == "Medium" then Settings.MaxAimAngle = 25
+    elseif v == "Wide" then Settings.MaxAimAngle = 90 end
 end)
 makeCycle(panel, 372, "Mode",  { "Rage", "Light" }, Settings.Mode, function(v)
     Settings.Mode = v
@@ -571,12 +619,12 @@ local function doPanic()
     end)
 end
 panic.MouseButton1Click:Connect(doPanic)
-panic.TouchTap:Connect(doPanic)
+bindButtonPress(panic, doPanic)
 
 local function notify(msg)
     pcall(function()
         StarterGui:SetCore("SendNotification", {
-            Title = "Hardcok Mobile v3", Text = msg, Duration = 3,
+            Title = "Hardcok Mobile v4", Text = msg, Duration = 3,
         })
     end)
     print("[Hardcok] " .. msg)
@@ -593,4 +641,4 @@ task.spawn(function()
     end
 end)
 
-notify("Hardcok Mobile v3 loaded — tap HC")
+notify("Hardcok Mobile v4 loaded — tap HC")
