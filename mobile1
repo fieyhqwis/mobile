@@ -432,37 +432,34 @@ local function bindButtonPress(btn, onPress)
     end)
 end
 
--- FAB: drag to move, tap to open panel
-do
-    bindButtonPress(fab, function()
-        panel.Visible = not panel.Visible
-    end)
-    local dragging, dragStart, startPos
-    fab.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging  = true
-            dragStart = Vector2.new(input.Position.X, input.Position.Y)
-            startPos  = fab.Position
-        end
-    end)
-    UserInputService.InputChanged:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
-        local d = Vector2.new(input.Position.X, input.Position.Y) - dragStart
-        fab.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y
-        )
-    end)
-    fab.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-end
+-- Drag state for the FAB (single, reused, no duplicate listeners).
+local fabDragging, fabDragStart, fabStartPos = false, nil, nil
+fab.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        fabDragging  = true
+        fabDragStart = Vector2.new(input.Position.X, input.Position.Y)
+        fabStartPos  = fab.Position
+    end
+end)
+fab.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+    or input.UserInputType == Enum.UserInputType.Touch then
+        fabDragging = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not fabDragging then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+    and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local d = Vector2.new(input.Position.X, input.Position.Y) - fabDragStart
+    fab.Position = UDim2.new(
+        fabStartPos.X.Scale, fabStartPos.X.Offset + d.X,
+        fabStartPos.Y.Scale, fabStartPos.Y.Offset + d.Y
+    )
+end)
+
+-- (panel is created below; FAB tap is wired after panel exists)
 
 local panel = make("Frame", {
     Name             = "HC_Panel",
@@ -621,6 +618,11 @@ end
 panic.MouseButton1Click:Connect(doPanic)
 bindButtonPress(panic, doPanic)
 
+-- Wire the FAB tap-to-open-panel handler NOW that panel exists.
+bindButtonPress(fab, function()
+    panel.Visible = not panel.Visible
+end)
+
 local function notify(msg)
     pcall(function()
         StarterGui:SetCore("SendNotification", {
@@ -642,3 +644,5 @@ task.spawn(function()
 end)
 
 notify("Hardcok Mobile v4 loaded — tap HC")
+print("[Hardcok] v4 script fully loaded; HC button should be visible bottom-left")
+print("[Hardcok] IS_MOBILE=" .. tostring(IS_MOBILE) .. ", fab.Parent=" .. tostring(fab.Parent and fab.Parent:GetFullName() or "nil"))
