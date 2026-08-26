@@ -1,0 +1,622 @@
+-- ==========================================
+-- HARDCOK MOBILE v4 — Chams + Aimbot
+-- v4: zero direct camera writes when target is off-axis.
+-- Uses mousemoverel on PC; on mobile, only aims when target is
+-- within MaxAimAngle degrees of crosshair (no fight with the game camera).
+-- ==========================================
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+local StarterGui       = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+
+local IS_MOBILE = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+
+-- ------------------------------------------
+-- SETTINGS
+-- ------------------------------------------
+local Settings = {
+    AimbotEnabled    = true,
+    Mode             = "Rage",     -- "Rage" (snap) or "Light" (smooth)
+    HoldToAim        = false,
+    TargetPart       = "Head",
+    WallCheck        = true,
+    TeamCheck        = true,
+    NPCCheck         = true,
+    ESPMode          = "Chams",
+    ChamsEnemiesOnly = true,
+    ChamsMaxDist     = 1500,
+
+    -- The single most important setting. Only aim at targets within
+    -- MaxAimAngle degrees of the crosshair. Default 25° = "roughly in front"
+    -- Set to 5° for very strict (you basically have to be aimed at them).
+    -- Set to 180° for "anywhere, including behind" (will cause shake).
+    MaxAimAngle      = 25,
+}
+
+-- ------------------------------------------
+-- ROLE-BASED TEAM
+-- ------------------------------------------
+local ROLE_GROUPS = {
+    ["d_class"]          = 1,
+    ["chaos_insurgency"] = 1,
+    ["scientist"]        = 2,
+    ["director"]         = 2,
+    ["mtf"]              = 2,
+    ["security"]         = 2,
+}
+local GROUP_COLORS = {
+    [1] = Color3.fromRGB(255, 150, 58),
+    [2] = Color3.fromRGB(120, 170, 255),
+}
+
+local function getRoleGroup(player)
+    local role = player:GetAttribute("Role")
+    if type(role) ~= "string" then return nil end
+    return ROLE_GROUPS[role:lower()]
+end
+
+local function isEnemy(player)
+    if not Settings.TeamCheck then return true end
+    local mine, theirs = getRoleGroup(LocalPlayer), getRoleGroup(player)
+    if not mine or not theirs then return true end
+    return mine ~= theirs
+end
+
+local function getTeamColor(player)
+    local g = getRoleGroup(player)
+    return GROUP_COLORS[g] or Color3.fromRGB(255, 255, 255)
+end
+
+-- ------------------------------------------
+-- NPC CACHE
+-- ------------------------------------------
+local cachedNPCs = {}
+task.spawn(function()
+    while task.wait(1) do
+        if not Settings.NPCCheck then
+            cachedNPCs = {}
+            continue
+        end
+        local t = {}
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Model") and obj:GetAttribute("Role") == nil then
+                local hum = obj:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(obj) then
+                    t[#t + 1] = obj
+                end
+            end
+        end
+        cachedNPCs = t
+    end
+end)
+
+-- ------------------------------------------
+-- VISIBILITY
+-- ------------------------------------------
+local function isVisible(targetPart, targetChar, useWall)
+    if not useWall then return true end
+    local cam = Workspace.CurrentCamera
+    if not cam then return true end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { cam, LocalPlayer.Character }
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local origin = cam.CFrame.Position
+    local dir    = targetPart.Position - origin
+    for _ = 1, 4 do
+        local ok, result = pcall(function() return Workspace:Raycast(origin, dir, params) end)
+        if not ok or not result then return true end
+        if result.Instance:IsDescendantOf(targetChar) then return true end
+        local transparency = 1
+        pcall(function() transparency = result.Instance.Transparency end)
+        if transparency < 0.5 then return false end
+        local traveled  = (result.Position - origin).Magnitude
+        local remaining = dir.Magnitude - traveled
+        if remaining <= 0.1 then return true end
+        origin = result.Position + dir.Unit * 0.1
+        dir    = dir.Unit * remaining
+    end
+    return true
+end
+
+local function getTargetPart(char)
+    return char:FindFirstChild(Settings.TargetPart)
+        or char:FindFirstChild("Head")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("HumanoidRootPart")
+end
+
+-- ------------------------------------------
+-- TARGETING
+-- Pick the target whose Head is closest to the crosshair in screen-space.
+-- This is WAY more accurate than "closest 3D distance" for aimbot purposes
+-- because what you see is what you aim at. A target 5m in front of you
+-- but off to the side is less likely to be hit than a target 50m away
+-- that's directly in front of you.
+-- ------------------------------------------
+local function getOnScreenTarget()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local mousePos = UserInputService:GetMouseLocation()
+    local viewport = cam.ViewportSize
+    local best, bestDist = nil, math.huge
+    for _, char in ipairs(Players:GetPlayers()) do
+        if char ~= LocalPlayer and char.Character and isEnemy(char) then
+            local hum = char.Character:FindFirstChildOfClass("Humanoid")
+            if hum and hum.Health > 0 then
+                local part = getTargetPart(char.Character)
+                if part then
+                    if isVisible(part, char.Character, Settings.WallCheck) then
+                        local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+                        if onScreen then
+                            local dx = sp.X - mousePos.X
+                            local dy = sp.Y - mousePos.Y
+                            local screenDist = math.sqrt(dx * dx + dy * dy)
+                            if screenDist < bestDist then
+                                bestDist = screenDist
+                                best = part
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if Settings.NPCCheck then
+        for _, npc in ipairs(cachedNPCs) do
+            if npc and npc.Parent then
+                local hum = npc:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 then
+                    local part = getTargetPart(npc)
+                    if part then
+                        if isVisible(part, npc, Settings.WallCheck) then
+                            local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+                            if onScreen then
+                                local dx = sp.X - mousePos.X
+                                local dy = sp.Y - mousePos.Y
+                                local screenDist = math.sqrt(dx * dx + dy * dy)
+                                if screenDist < bestDist then
+                                    bestDist = screenDist
+                                    best = part
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- ------------------------------------------
+-- ESP / CHAMS
+-- ------------------------------------------
+local ESPStorage = {}
+local HIGHLIGHT_BUDGET = 24
+
+local function removeESP(player)
+    local d = ESPStorage[player]
+    if not d then return end
+    if d.Highlight then pcall(function() d.Highlight:Destroy() end) end
+    ESPStorage[player] = nil
+end
+
+local function createESP(player)
+    if player == LocalPlayer then return end
+    removeESP(player)
+    ESPStorage[player] = { Highlight = nil }
+end
+
+local function computeChamsSet()
+    local cam = Workspace.CurrentCamera
+    local want = {}
+    if Settings.ESPMode ~= "Chams" or not cam then return want end
+    local myPos = cam.CFrame.Position
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            if not (Settings.ChamsEnemiesOnly and not isEnemy(p)) then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart") or p.Character.PrimaryPart
+                if hrp then
+                    local d = (hrp.Position - myPos).Magnitude
+                    if d <= Settings.ChamsMaxDist then want[p] = d end
+                end
+            end
+        end
+    end
+    local n = 0
+    for _ in pairs(want) do n += 1 end
+    if n > HIGHLIGHT_BUDGET then
+        local sorted = {}
+        for p, d in pairs(want) do sorted[#sorted + 1] = { p = p, d = d } end
+        table.sort(sorted, function(a, b) return a.d < b.d end)
+        local keep = {}
+        for i = 1, HIGHLIGHT_BUDGET do keep[sorted[i].p] = sorted[i].d end
+        return keep
+    end
+    return want
+end
+
+local function updateChams(player, chamsSet)
+    local d = ESPStorage[player]
+    if not d then return end
+    local char = player.Character
+    if not char then return end
+    local wantChams = chamsSet and chamsSet[player] ~= nil
+    if d.Highlight and d.Highlight.Parent ~= char then
+        pcall(function() d.Highlight:Destroy() end)
+        d.Highlight = nil
+    end
+    if wantChams then
+        if not d.Highlight then
+            local hl = Instance.new("Highlight")
+            hl.Name = "HC_Chams"
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Parent = char
+            d.Highlight = hl
+        end
+        local c = getTeamColor(player)
+        d.Highlight.FillColor           = c
+        d.Highlight.OutlineColor        = Color3.fromRGB(255, 255, 255)
+        d.Highlight.FillTransparency    = 0.55
+        d.Highlight.OutlineTransparency = 0
+        d.Highlight.Enabled             = true
+    else
+        if d.Highlight then
+            pcall(function() d.Highlight:Destroy() end)
+            d.Highlight = nil
+        end
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then createESP(p) end
+end
+Players.PlayerAdded:Connect(createESP)
+Players.PlayerRemoving:Connect(removeESP)
+
+-- ------------------------------------------
+-- INPUT
+-- ------------------------------------------
+local isRMBHeld = false
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        isRMBHeld = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        isRMBHeld = false
+    end
+end)
+
+-- ------------------------------------------
+-- AIMBOT (v4: no fight with the game)
+-- Two paths, picked at load:
+--   PC:    mousemoverel (the game's input system absorbs the delta)
+--   MOBILE: ONLY aim if target is within MaxAimAngle degrees of crosshair,
+--           and only do a SOFT lerp (alpha derived from angle, capped at 0.4).
+--           This is the absolute cleanest way to avoid camera shake on
+--           custom-camera games on mobile.
+-- ------------------------------------------
+RunService.RenderStepped:Connect(function()
+    Camera = Workspace.CurrentCamera or Camera
+
+    local wantAim = Settings.AimbotEnabled and (not Settings.HoldToAim or isRMBHeld)
+    if wantAim then
+        local target = getOnScreenTarget()
+        if target then
+            local cam = Workspace.CurrentCamera
+            if cam then
+                local mousePos = UserInputService:GetMouseLocation()
+                local sp, onScreen = cam:WorldToViewportPoint(target.Position)
+                if onScreen then
+                    local dx = sp.X - mousePos.X
+                    local dy = sp.Y - mousePos.Y
+                    local screenDist = math.sqrt(dx * dx + dy * dy)
+
+                    -- Estimate the angle from crosshair to target.
+                    -- Heuristic: at default FOV, viewport width = 2*tan(fov/2)*distance.
+                    -- For simplicity, we use screenDist / (viewport/2) as a proxy
+                    -- for "fraction of half-screen away", and convert.
+                    local fovRad = math.rad(cam.FieldOfView)
+                    local pixelsPerRad = (cam.ViewportSize.Y / 2) / math.tan(fovRad / 2)
+                    local angleDeg = math.deg(screenDist / pixelsPerRad)
+
+                    if angleDeg <= Settings.MaxAimAngle then
+                        if not IS_MOBILE and mousemoverel then
+                            -- PC path: feed delta to the game's input pipeline
+                            local strength = (Settings.Mode == "Rage") and 1.0 or 0.35
+                            local maxStep = (Settings.Mode == "Rage") and 60 or 25
+                            local mx = math.clamp(dx * strength, -maxStep, maxStep)
+                            local my = math.clamp(dy * strength, -maxStep, maxStep)
+                            if math.abs(mx) > 0.1 or math.abs(my) > 0.1 then
+                                pcall(mousemoverel, mx, my)
+                            end
+                        else
+                            -- Mobile path: SOFT lerp, alpha tied to distance-to-target.
+                            -- Target close to crosshair = small alpha = minimal visible movement.
+                            -- Target at edge of cone = larger alpha = still capped movement.
+                            local t = math.clamp((Settings.MaxAimAngle - angleDeg) / Settings.MaxAimAngle, 0.02, 0.4)
+                            local camPos = cam.CFrame.Position
+                            local toTarget = target.Position - camPos
+                            if toTarget.Magnitude > 0.05 and math.abs(toTarget.Unit.Y) < 0.995 then
+                                local goal = CFrame.new(camPos, target.Position)
+                                if goal.Position.X == goal.Position.X then
+                                    cam.CFrame = cam.CFrame:Lerp(goal, t)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- If no target in cone, do NOTHING. Camera left alone.
+    end
+
+    local chamsSet = computeChamsSet()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            if not ESPStorage[p] then createESP(p) end
+            updateChams(p, chamsSet)
+        end
+    end
+end)
+
+-- ------------------------------------------
+-- GUI (same as v3)
+-- ==========================================
+local function make(class, props, parent)
+    local i = Instance.new(class)
+    for k, v in pairs(props or {}) do i[k] = v end
+    if parent then i.Parent = parent end
+    return i
+end
+
+local gui = make("ScreenGui", {
+    Name             = "HardcokMobile",
+    ResetOnSpawn     = false,
+    ZIndexBehavior   = Enum.ZIndexBehavior.Sibling,
+    IgnoreGuiInset   = true,
+    DisplayOrder     = 999,
+}, PlayerGui)
+pcall(function() gui.Parent = game:GetService("CoreGui") end)
+
+local fab = make("TextButton", {
+    Name             = "HC_FAB",
+    Text             = "HC",
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 20,
+    TextColor3       = Color3.fromRGB(255, 255, 255),
+    BackgroundColor3 = Color3.fromRGB(20, 20, 25),
+    BackgroundTransparency = 0.15,
+    BorderSizePixel  = 0,
+    Size             = UDim2.fromOffset(56, 56),
+    Position         = UDim2.new(0, 16, 0.5, -28),
+    AutoButtonColor  = false,
+}, gui)
+make("UICorner", { CornerRadius = UDim.new(1, 0) }, fab)
+make("UIStroke", { Thickness = 2, Color = Color3.fromRGB(120, 170, 255) }, fab)
+
+do
+    local dragging, dragStart, startPos
+    fab.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging  = true
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            startPos  = fab.Position
+        end
+    end)
+    fab.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            if dragging then
+                dragging = false
+                if (dragStart - Vector2.new(input.Position.X, input.Position.Y)).Magnitude < 8 then
+                    panel.Visible = not panel.Visible
+                end
+            end
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement
+        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local d = Vector2.new(input.Position.X, input.Position.Y) - dragStart
+        fab.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end)
+end
+
+local panel = make("Frame", {
+    Name             = "HC_Panel",
+    BackgroundColor3 = Color3.fromRGB(18, 18, 22),
+    BackgroundTransparency = 0.05,
+    BorderSizePixel  = 0,
+    Size             = UDim2.fromOffset(260, 460),
+    Position         = UDim2.new(0, 80, 0.5, -230),
+    Visible          = false,
+    Active           = true,
+}, gui)
+make("UICorner", { CornerRadius = UDim.new(0, 12) }, panel)
+make("UIStroke", { Color = Color3.fromRGB(80, 80, 100), Thickness = 1.5 }, panel)
+
+make("TextLabel", {
+    Name             = "Title",
+    Text             = "Hardcok Mobile v4",
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 18,
+    TextColor3       = Color3.fromRGB(255, 255, 255),
+    BackgroundTransparency = 1,
+    Size             = UDim2.new(1, -16, 0, 36),
+    Position         = UDim2.new(0, 16, 0, 8),
+    TextXAlignment   = Enum.TextXAlignment.Left,
+}, panel)
+
+local function makeToggle(parent, y, label, default, onChange)
+    local row = make("Frame", {
+        BackgroundTransparency = 1,
+        Size             = UDim2.new(1, -32, 0, 40),
+        Position         = UDim2.new(0, 16, 0, y),
+    }, parent)
+    make("TextLabel", {
+        Text             = label,
+        Font             = Enum.Font.Gotham,
+        TextSize         = 15,
+        TextColor3       = Color3.fromRGB(230, 230, 235),
+        BackgroundTransparency = 1,
+        Size             = UDim2.new(1, -90, 1, 0),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+    }, row)
+    local btn = make("TextButton", {
+        Text             = default and "ON" or "OFF",
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 13,
+        TextColor3       = Color3.fromRGB(255, 255, 255),
+        BackgroundColor3 = default and Color3.fromRGB(60, 160, 90) or Color3.fromRGB(120, 60, 60),
+        BorderSizePixel  = 0,
+        Size             = UDim2.fromOffset(64, 28),
+        Position         = UDim2.new(1, -64, 0.5, -14),
+    }, row)
+    make("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+    local state = default
+    local function flip()
+        state = not state
+        btn.Text = state and "ON" or "OFF"
+        btn.BackgroundColor3 = state and Color3.fromRGB(60, 160, 90) or Color3.fromRGB(120, 60, 60)
+        if onChange then onChange(state) end
+    end
+    btn.MouseButton1Click:Connect(flip)
+    btn.TouchTap:Connect(flip)
+    return btn
+end
+
+local function makeCycle(parent, y, label, options, default, onChange)
+    local row = make("Frame", {
+        BackgroundTransparency = 1,
+        Size             = UDim2.new(1, -32, 0, 40),
+        Position         = UDim2.new(0, 16, 0, y),
+    }, parent)
+    make("TextLabel", {
+        Text             = label,
+        Font             = Enum.Font.Gotham,
+        TextSize         = 15,
+        TextColor3       = Color3.fromRGB(230, 230, 235),
+        BackgroundTransparency = 1,
+        Size             = UDim2.new(0, 110, 1, 0),
+        TextXAlignment   = Enum.TextXAlignment.Left,
+    }, row)
+    local idx = 1
+    for i, opt in ipairs(options) do if opt == default then idx = i end end
+    local btn = make("TextButton", {
+        Text             = options[idx],
+        Font             = Enum.Font.GothamBold,
+        TextSize         = 13,
+        TextColor3       = Color3.fromRGB(255, 255, 255),
+        BackgroundColor3 = Color3.fromRGB(40, 50, 70),
+        BorderSizePixel  = 0,
+        Size             = UDim2.fromOffset(120, 28),
+        Position         = UDim2.new(1, -120, 0.5, -14),
+    }, row)
+    make("UICorner", { CornerRadius = UDim.new(0, 6) }, btn)
+    local function cycle()
+        idx = idx % #options + 1
+        btn.Text = options[idx]
+        if onChange then onChange(options[idx]) end
+    end
+    btn.MouseButton1Click:Connect(cycle)
+    btn.TouchTap:Connect(cycle)
+    return btn
+end
+
+local aimBtn = makeToggle(panel, 50, "Aimbot", Settings.AimbotEnabled, function(v)
+    Settings.AimbotEnabled = v
+end)
+makeToggle(panel, 96, "Hold RMB to Aim", Settings.HoldToAim, function(v)
+    Settings.HoldToAim = v
+end)
+makeToggle(panel, 142, "Team Check", Settings.TeamCheck, function(v)
+    Settings.TeamCheck = v
+end)
+makeToggle(panel, 188, "Wall Check", Settings.WallCheck, function(v)
+    Settings.WallCheck = v
+end)
+makeToggle(panel, 234, "NPC Check", Settings.NPCCheck, function(v)
+    Settings.NPCCheck = v
+end)
+makeToggle(panel, 280, "Chams", Settings.ESPMode == "Chams", function(v)
+    Settings.ESPMode = v and "Chams" or "Disabled"
+end)
+makeCycle(panel, 326, "Aim Cone",  { "Tight", "Medium", "Wide" }, "Medium", function(v)
+    if v == "Tight" then Settings.MaxAimAngle = 10
+    elseif v == "Medium" then Settings.MaxAimAngle = 25
+    elseif v == "Wide" then Settings.MaxAimAngle = 90 end
+end)
+makeCycle(panel, 372, "Mode",  { "Rage", "Light" }, Settings.Mode, function(v)
+    Settings.Mode = v
+end)
+makeCycle(panel, 418, "Target", { "Head", "Torso", "HRP" },
+    Settings.TargetPart == "HumanoidRootPart" and "HRP" or Settings.TargetPart,
+    function(v)
+        Settings.TargetPart = (v == "HRP") and "HumanoidRootPart" or v
+    end
+)
+
+local panic = make("TextButton", {
+    Name             = "Panic",
+    Text             = "PANIC",
+    Font             = Enum.Font.GothamBold,
+    TextSize         = 16,
+    TextColor3       = Color3.fromRGB(255, 255, 255),
+    BackgroundColor3 = Color3.fromRGB(180, 40, 40),
+    BorderSizePixel  = 0,
+    Size             = UDim2.new(1, -32, 0, 40),
+    Position         = UDim2.new(0, 16, 1, -52),
+}, panel)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, panic)
+local function doPanic()
+    Settings.AimbotEnabled = false
+    Settings.ESPMode = "Disabled"
+    panel.Visible = false
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Hardcok", Text = "PANIC — all off", Duration = 2,
+        })
+    end)
+end
+panic.MouseButton1Click:Connect(doPanic)
+panic.TouchTap:Connect(doPanic)
+
+local function notify(msg)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "Hardcok Mobile v4", Text = msg, Duration = 3,
+        })
+    end)
+    print("[Hardcok] " .. msg)
+end
+
+task.spawn(function()
+    while task.wait(0.5) do
+        local on = Settings.AimbotEnabled
+        pcall(function()
+            fab.BackgroundColor3 = on
+                and Color3.fromRGB(30, 70, 40)
+                or Color3.fromRGB(50, 30, 30)
+        end)
+    end
+end)
+
+notify("Hardcok Mobile v4 loaded — tap HC")
