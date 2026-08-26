@@ -1,0 +1,348 @@
+-- ==========================================
+-- HARDCOK MOBILE v1 — Chams + Aimbot
+-- Designed for Delta (mobile) and PC
+-- No UI lib required — controls via chat commands
+-- ==========================================
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace        = game:GetService("Workspace")
+local StarterGui       = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+
+-- ------------------------------------------
+-- SETTINGS
+-- ------------------------------------------
+local Settings = {
+    AimbotEnabled = true,
+    Mode          = "Rage",        -- "Rage" (snap) or "Light" (smooth)
+    HoldToAim     = false,         -- mobile: usually leave off so it's always on
+    TargetPart    = "Head",        -- "Head" / "Torso" / "HumanoidRootPart"
+    WallCheck     = true,
+    TeamCheck     = true,
+    NPCCheck      = true,
+    ESPMode       = "Chams",       -- "Chams" / "Disabled"
+    ChamsEnemiesOnly = true,
+    ChamsMaxDist  = 1500,
+}
+
+-- ------------------------------------------
+-- ROLE-BASED TEAM (matches this game)
+-- ------------------------------------------
+local ROLE_GROUPS = {
+    ["d_class"]          = 1,
+    ["chaos_insurgency"] = 1,
+    ["scientist"]        = 2,
+    ["director"]         = 2,
+    ["mtf"]              = 2,
+    ["security"]         = 2,
+}
+local GROUP_COLORS = {
+    [1] = Color3.fromRGB(255, 150, 58),
+    [2] = Color3.fromRGB(120, 170, 255),
+}
+
+local function getRoleGroup(player)
+    local role = player:GetAttribute("Role")
+    if type(role) ~= "string" then return nil end
+    return ROLE_GROUPS[role:lower()]
+end
+
+local function isEnemy(player)
+    if not Settings.TeamCheck then return true end
+    local mine, theirs = getRoleGroup(LocalPlayer), getRoleGroup(player)
+    if not mine or not theirs then return true end
+    return mine ~= theirs
+end
+
+local function getTeamColor(player)
+    local g = getRoleGroup(player)
+    return GROUP_COLORS[g] or Color3.fromRGB(255, 255, 255)
+end
+
+-- ------------------------------------------
+-- NPC CACHE
+-- ------------------------------------------
+local cachedNPCs = {}
+task.spawn(function()
+    while task.wait(1) do
+        if not Settings.NPCCheck then
+            cachedNPCs = {}
+            continue
+        end
+        local t = {}
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("Model") and obj:GetAttribute("Role") == nil then
+                local hum = obj:FindFirstChildOfClass("Humanoid")
+                if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(obj) then
+                    t[#t + 1] = obj
+                end
+            end
+        end
+        cachedNPCs = t
+    end
+end)
+
+-- ------------------------------------------
+-- VISIBILITY
+-- ------------------------------------------
+local function isVisible(targetPart, targetChar, useWall)
+    if not useWall then return true end
+    local cam = Workspace.CurrentCamera
+    if not cam then return true end
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { cam, LocalPlayer.Character }
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local origin = cam.CFrame.Position
+    local dir    = targetPart.Position - origin
+    for _ = 1, 4 do
+        local ok, result = pcall(function() return Workspace:Raycast(origin, dir, params) end)
+        if not ok or not result then return true end
+        if result.Instance:IsDescendantOf(targetChar) then return true end
+        local transparency = 1
+        pcall(function() transparency = result.Instance.Transparency end)
+        if transparency < 0.5 then return false end
+        local traveled  = (result.Position - origin).Magnitude
+        local remaining = dir.Magnitude - traveled
+        if remaining <= 0.1 then return true end
+        origin = result.Position + dir.Unit * 0.1
+        dir    = dir.Unit * remaining
+    end
+    return true
+end
+
+local function getTargetPart(char)
+    return char:FindFirstChild(Settings.TargetPart)
+        or char:FindFirstChild("Head")
+        or char:FindFirstChild("UpperTorso")
+        or char:FindFirstChild("Torso")
+        or char:FindFirstChild("HumanoidRootPart")
+end
+
+-- ------------------------------------------
+-- TARGETING
+-- ------------------------------------------
+local function getValidTargets()
+    local t = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character and isEnemy(p) then
+            t[#t + 1] = p.Character
+        end
+    end
+    if Settings.NPCCheck then
+        for _, npc in ipairs(cachedNPCs) do
+            if npc and npc.Parent then t[#t + 1] = npc end
+        end
+    end
+    return t
+end
+
+local function getClosestTarget()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local myPos = cam.CFrame.Position
+    local best, bestScore = nil, math.huge
+    for _, char in ipairs(getValidTargets()) do
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            local part = getTargetPart(char)
+            if part then
+                local score = (part.Position - myPos).Magnitude
+                if isVisible(part, char, Settings.WallCheck) then
+                    if score < bestScore then bestScore, best = score, part end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- ------------------------------------------
+-- ESP / CHAMS
+-- ------------------------------------------
+local ESPStorage = {}
+local HIGHLIGHT_BUDGET = 24
+
+local function removeESP(player)
+    local d = ESPStorage[player]
+    if not d then return end
+    if d.Highlight then pcall(function() d.Highlight:Destroy() end) end
+    ESPStorage[player] = nil
+end
+
+local function createESP(player)
+    if player == LocalPlayer then return end
+    removeESP(player)
+    ESPStorage[player] = { Highlight = nil }
+end
+
+local function computeChamsSet()
+    local cam = Workspace.CurrentCamera
+    local want = {}
+    if Settings.ESPMode ~= "Chams" or not cam then return want end
+    local myPos = cam.CFrame.Position
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p.Character then
+            if not (Settings.ChamsEnemiesOnly and not isEnemy(p)) then
+                local hrp = p.Character:FindFirstChild("HumanoidRootPart") or p.Character.PrimaryPart
+                if hrp then
+                    local d = (hrp.Position - myPos).Magnitude
+                    if d <= Settings.ChamsMaxDist then want[p] = d end
+                end
+            end
+        end
+    end
+    local n = 0
+    for _ in pairs(want) do n += 1 end
+    if n > HIGHLIGHT_BUDGET then
+        local sorted = {}
+        for p, d in pairs(want) do sorted[#sorted + 1] = { p = p, d = d } end
+        table.sort(sorted, function(a, b) return a.d < b.d end)
+        local keep = {}
+        for i = 1, HIGHLIGHT_BUDGET do keep[sorted[i].p] = sorted[i].d end
+        return keep
+    end
+    return want
+end
+
+local function updateChams(player, chamsSet)
+    local d = ESPStorage[player]
+    if not d then return end
+    local char = player.Character
+    if not char then return end
+    local wantChams = chamsSet and chamsSet[player] ~= nil
+    if d.Highlight and d.Highlight.Parent ~= char then
+        pcall(function() d.Highlight:Destroy() end)
+        d.Highlight = nil
+    end
+    if wantChams then
+        if not d.Highlight then
+            local hl = Instance.new("Highlight")
+            hl.Name = "HC_Chams"
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Parent = char
+            d.Highlight = hl
+        end
+        local c = getTeamColor(player)
+        d.Highlight.FillColor           = c
+        d.Highlight.OutlineColor        = Color3.fromRGB(255, 255, 255)
+        d.Highlight.FillTransparency    = 0.55
+        d.Highlight.OutlineTransparency = 0
+        d.Highlight.Enabled             = true
+    else
+        if d.Highlight then
+            pcall(function() d.Highlight:Destroy() end)
+            d.Highlight = nil
+        end
+    end
+end
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then createESP(p) end
+end
+Players.PlayerAdded:Connect(createESP)
+Players.PlayerRemoving:Connect(removeESP)
+
+-- ------------------------------------------
+-- INPUT (PC RMB-hold; mobile = always-on if HoldToAim is off)
+-- ------------------------------------------
+local isRMBHeld = false
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        isRMBHeld = true
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        isRMBHeld = false
+    end
+end)
+
+-- ------------------------------------------
+-- MAIN LOOP
+-- ------------------------------------------
+RunService.RenderStepped:Connect(function()
+    Camera = Workspace.CurrentCamera or Camera
+
+    local wantAim = Settings.AimbotEnabled
+        and (not Settings.HoldToAim or isRMBHeld)
+    if wantAim then
+        local target = getClosestTarget()
+        if target then
+            local smoothness = (Settings.Mode == "Rage") and 0.95 or 0.15
+            local camPos = Camera.CFrame.Position
+            local dir = target.Position - camPos
+            if dir.Magnitude > 0.05 and math.abs(dir.Unit.Y) < 0.995 then
+                local goal = CFrame.new(camPos, target.Position)
+                if goal.Position.X == goal.Position.X then -- NaN guard
+                    Camera.CFrame = Camera.CFrame:Lerp(goal, smoothness)
+                end
+            end
+        end
+    end
+
+    local chamsSet = computeChamsSet()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            if not ESPStorage[p] then createESP(p) end
+            updateChams(p, chamsSet)
+        end
+    end
+end)
+
+-- ------------------------------------------
+-- CHAT COMMANDS (works on mobile + PC)
+--   ;aim on|off          toggle aimbot
+--   ;mode rage|light     change mode
+--   ;part head|torso|hrp target part
+--   ;esp on|off          toggle chams
+--   ;panic               kill everything
+--   ;help                show commands
+-- ------------------------------------------
+local function notify(msg)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title    = "Hardcok Mobile",
+            Text     = msg,
+            Duration = 3,
+        })
+    end)
+    print("[Hardcok] " .. msg)
+end
+
+Players.LocalPlayer.Chatted:Connect(function(msg)
+    msg = msg:lower()
+    if msg == ";aim on" then
+        Settings.AimbotEnabled = true; notify("Aimbot ON")
+    elseif msg == ";aim off" then
+        Settings.AimbotEnabled = false; notify("Aimbot OFF")
+    elseif msg == ";mode rage" then
+        Settings.Mode = "Rage"; notify("Mode: Rage (snap)")
+    elseif msg == ";mode light" then
+        Settings.Mode = "Light"; notify("Mode: Light (smooth)")
+    elseif msg == ";part head" then
+        Settings.TargetPart = "Head"; notify("Target: Head")
+    elseif msg == ";part torso" then
+        Settings.TargetPart = "Torso"; notify("Target: Torso")
+    elseif msg == ";part hrp" then
+        Settings.TargetPart = "HumanoidRootPart"; notify("Target: HRP")
+    elseif msg == ";esp on" then
+        Settings.ESPMode = "Chams"; notify("ESP: Chams")
+    elseif msg == ";esp off" then
+        Settings.ESPMode = "Disabled"; notify("ESP: Off")
+    elseif msg == ";panic" then
+        Settings.AimbotEnabled = false
+        Settings.ESPMode = "Disabled"
+        notify("PANIC — all off")
+    elseif msg == ";help" then
+        notify(";aim ;mode ;part ;esp ;panic ;help")
+    end
+end)
+
+notify("Hardcok Mobile loaded — type ;help")
