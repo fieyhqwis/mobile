@@ -643,6 +643,6 @@ task.spawn(function()
     end
 end)
 
-notify("Hardcok Mobile v4 loaded — tap HC")
+notify("Hardcok Mobile v4 loaded — tap 2HC")
 print("[Hardcok] v4 script fully loaded; HC button should be visible bottom-left")
 print("[Hardcok] IS_MOBILE=" .. tostring(IS_MOBILE) .. ", fab.Parent=" .. tostring(fab.Parent and fab.Parent:GetFullName() or "nil"))
