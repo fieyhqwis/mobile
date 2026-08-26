@@ -1,36 +1,76 @@
 -- ==========================================
--- HARDCOK MOBILE v1 — Chams + Aimbot
--- Designed for Delta (mobile) and PC
--- No UI lib required — controls via chat commands
+-- UNIVERSAL BY HARDCOK v3 — merged
+-- Aimbot (orig-style, simple) + ESP (v2) + Silent Aim (fixed) + Click TP
 -- ==========================================
+
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace        = game:GetService("Workspace")
-local StarterGui       = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera      = Workspace.CurrentCamera
 
 -- ------------------------------------------
+-- DEBUG
+-- ------------------------------------------
+getgenv().HC_DEBUG = getgenv().HC_DEBUG or {
+    hookCalls   = 0,
+    hookMatch   = 0,
+    hookRedirect= 0,
+    hookNoTarget= 0,
+    hookErr     = "",
+    aimFound    = 0,
+    tp          = 0,
+    lastOrigin  = "",
+    lastDir     = "",
+}
+local DBG = getgenv().HC_DEBUG
+
+-- ------------------------------------------
 -- SETTINGS
 -- ------------------------------------------
 local Settings = {
-    AimbotEnabled = true,
-    Mode          = "Rage",        -- "Rage" (snap) or "Light" (smooth)
-    HoldToAim     = false,         -- mobile: usually leave off so it's always on
-    TargetPart    = "Head",        -- "Head" / "Torso" / "HumanoidRootPart"
-    WallCheck     = true,
-    TeamCheck     = true,
-    NPCCheck      = true,
-    ESPMode       = "Chams",       -- "Chams" / "Disabled"
+    -- Aimbot — one switch. Light = smooth, Rage = snap.
+    AimbotEnabled    = true,
+    Mode             = "Rage",        -- "Light" or "Rage"
+    HoldToAim        = true,          -- hold RMB; if false, aim is always on
+    TargetPart       = "Head",
+    WallCheck        = true,
+    TeamCheck        = true,
+    NPCCheck         = true,
+
+    -- Spinmod extras
+    AutoTarget       = false,         -- 360 FOV (ignore screen/FOV)
+    AutoShoot        = false,
+    Spinbot          = false,
+    SpinSpeed        = 60,
+
+    -- Silent aim
+    Silent           = false,
+
+    -- Movement
+    ClickTP          = false,         -- hold Alt + left click
+
+    -- FOV + HUD
+    FOVEnabled       = true,
+    FOVRadius        = 200,
+    WatermarkEnabled = false,
+
+    -- ESP
+    ESPMode          = "Chams",       -- "Disabled", "Chams", "Drawing 2D"
+    ShowName         = true,
+    ShowDistance     = true,
+    ShowTeam         = true,
+    ShowHP           = true,
     ChamsEnemiesOnly = true,
-    ChamsMaxDist  = 1500,
+    ChamsMaxDist     = 2000,
 }
 
 -- ------------------------------------------
--- ROLE-BASED TEAM (matches this game)
+-- ROLE-BASED TEAM (v2 logic, matches this game)
 -- ------------------------------------------
 local ROLE_GROUPS = {
     ["d_class"]          = 1,
@@ -53,7 +93,8 @@ end
 
 local function isEnemy(player)
     if not Settings.TeamCheck then return true end
-    local mine, theirs = getRoleGroup(LocalPlayer), getRoleGroup(player)
+    local mine   = getRoleGroup(LocalPlayer)
+    local theirs = getRoleGroup(player)
     if not mine or not theirs then return true end
     return mine ~= theirs
 end
@@ -61,6 +102,30 @@ end
 local function getTeamColor(player)
     local g = getRoleGroup(player)
     return GROUP_COLORS[g] or Color3.fromRGB(255, 255, 255)
+end
+
+-- ------------------------------------------
+-- DRAWING (FOV + Watermark)
+-- ------------------------------------------
+local FOVCircle, Watermark
+do
+    local ok = pcall(function()
+        local t = Drawing.new("Circle"); t:Remove()
+    end)
+    if ok then
+        FOVCircle = Drawing.new("Circle")
+        FOVCircle.Color     = Color3.fromRGB(255, 255, 255)
+        FOVCircle.Thickness = 1.5
+        FOVCircle.Filled    = false
+        FOVCircle.Visible   = false
+
+        Watermark = Drawing.new("Text")
+        Watermark.Size     = 16
+        Watermark.Color    = Color3.fromRGB(255, 255, 255)
+        Watermark.Outline  = true
+        Watermark.Position = Vector2.new(15, 50)
+        Watermark.Visible  = false
+    end
 end
 
 -- ------------------------------------------
@@ -73,16 +138,16 @@ task.spawn(function()
             cachedNPCs = {}
             continue
         end
-        local t = {}
+        local temp = {}
         for _, obj in ipairs(Workspace:GetDescendants()) do
             if obj:IsA("Model") and obj:GetAttribute("Role") == nil then
                 local hum = obj:FindFirstChildOfClass("Humanoid")
                 if hum and hum.Health > 0 and not Players:GetPlayerFromCharacter(obj) then
-                    t[#t + 1] = obj
+                    temp[#temp + 1] = obj
                 end
             end
         end
-        cachedNPCs = t
+        cachedNPCs = temp
     end
 end)
 
@@ -145,14 +210,25 @@ end
 local function getClosestTarget()
     local cam = Workspace.CurrentCamera
     if not cam then return nil end
-    local myPos = cam.CFrame.Position
+    local myPos    = cam.CFrame.Position
+    local mousePos = UserInputService:GetMouseLocation()
     local best, bestScore = nil, math.huge
+
     for _, char in ipairs(getValidTargets()) do
         local hum = char:FindFirstChildOfClass("Humanoid")
         if hum and hum.Health > 0 then
             local part = getTargetPart(char)
             if part then
-                local score = (part.Position - myPos).Magnitude
+                local score
+                if Settings.AutoTarget or Settings.Spinbot then
+                    score = (part.Position - myPos).Magnitude
+                else
+                    local sp, onScreen = cam:WorldToViewportPoint(part.Position)
+                    if not onScreen then continue end
+                    local dist2D = (Vector2.new(sp.X, sp.Y) - mousePos).Magnitude
+                    if Settings.FOVEnabled and dist2D > Settings.FOVRadius then continue end
+                    score = dist2D
+                end
                 if isVisible(part, char, Settings.WallCheck) then
                     if score < bestScore then bestScore, best = score, part end
                 end
@@ -162,8 +238,128 @@ local function getClosestTarget()
     return best
 end
 
+local function getSilentTarget()
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local myPos = cam.CFrame.Position
+    local best, bestScore = nil, math.huge
+    for _, char in ipairs(getValidTargets()) do
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        local part = getTargetPart(char)
+        if hum and hum.Health > 0 and part then
+            if isVisible(part, char, Settings.WallCheck) then
+                local score = (part.Position - myPos).Magnitude
+                if score < bestScore then bestScore, best = score, part end
+            end
+        end
+    end
+    return best
+end
+
 -- ------------------------------------------
--- ESP / CHAMS
+-- INPUT
+-- ------------------------------------------
+local STATE = STATE
+local bindConn = (STATE and STATE.connect) or function(s, fn) return s:Connect(fn) end
+
+local isRMBHeld, isAltHeld = false, false
+
+bindConn(UserInputService.InputBegan, function(input, gpe)
+    if input.KeyCode == Enum.KeyCode.LeftAlt then isAltHeld = true; return end
+    if gpe then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then isRMBHeld = true; return end
+
+    -- Click TP
+    if not Settings.ClickTP then return end
+    if not isAltHeld then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    local cam  = Workspace.CurrentCamera
+    if not (cam and hrp and hum and hum.Health > 0) then return end
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { char, cam }
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local mousePos = UserInputService:GetMouseLocation()
+    local ray = cam:ViewportPointToRay(mousePos.X, mousePos.Y)
+    local hit = Workspace:Raycast(ray.Origin, ray.Direction * 2000, params)
+    local pos = hit and hit.Position or (ray.Origin + ray.Direction * 500)
+    pcall(function() char:PivotTo(CFrame.new(pos + Vector3.new(0, 3, 0))) end)
+    DBG.tp += 1
+end)
+
+bindConn(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then isRMBHeld = false end
+    if input.KeyCode == Enum.KeyCode.LeftAlt then isAltHeld = false end
+end)
+
+-- ------------------------------------------
+-- SILENT AIM — fixed signature
+-- Old v2 used a strict "origin == cam.CFrame.Position" + "mag 150-1500" check
+-- that rejected anything not matching exactly. New approach: only check the
+-- workspace argument + reasonable range, plus an opt-in method whitelist
+-- (Raycast / FindPartOnRayWithIgnoreList) so we don't grab unrelated raycasts.
+-- ------------------------------------------
+getgenv().HARDCOK_SILENT = getgenv().HARDCOK_SILENT or {}
+local SILENT = getgenv().HARDCOK_SILENT
+SILENT.active   = false
+SILENT.v2active = false
+
+SILENT.getTargetPos = function()
+    local part = getSilentTarget()
+    return part and part.Position or nil
+end
+
+if SILENT.v2hooked ~= true or SILENT.dmRef ~= game then
+    SILENT.v2hooked = true
+    SILENT.dmRef    = game
+    local old
+    old = hookmetamethod(game, "__namecall", function(self, ...)
+        if checkcaller() then return old(self, ...) end
+        if SILENT._inHook then return old(self, ...) end
+        if not SILENT.v2active then return old(self, ...) end
+
+        local method = getnamecallmethod()
+        if method ~= "Raycast" or self ~= Workspace then
+            return old(self, ...)
+        end
+
+        SILENT._inHook = true
+        local args = { ... }
+        DBG.hookCalls += 1
+        local ok, redirect, params = pcall(function()
+            local origin, direction = args[1], args[2]
+            if typeof(origin) ~= "Vector3" or typeof(direction) ~= "Vector3" then return nil end
+            local cam = Workspace.CurrentCamera
+            if not cam then return nil end
+            -- Looser than v2: only reject obviously-not-a-shot shapes
+            local mag = direction.Magnitude
+            if mag < 1 or mag > 5000 then return nil end
+            DBG.hookMatch += 1
+            local targetPos = SILENT.getTargetPos()
+            if not targetPos then DBG.hookNoTarget += 1; return nil end
+            local toTarget = targetPos - origin
+            local tDist = toTarget.Magnitude
+            if tDist < 0.05 then return nil end
+            return toTarget.Unit * mag, args[3]
+        end)
+        SILENT._inHook = false
+        if not ok then DBG.hookErr = tostring(redirect) end
+        if ok and redirect then
+            DBG.hookRedirect += 1
+            return old(self, args[1], redirect, params)
+        end
+        return old(self, ...)
+    end)
+end
+
+-- ------------------------------------------
+-- ESP
 -- ------------------------------------------
 local ESPStorage = {}
 local HIGHLIGHT_BUDGET = 24
@@ -171,6 +367,8 @@ local HIGHLIGHT_BUDGET = 24
 local function removeESP(player)
     local d = ESPStorage[player]
     if not d then return end
+    if d.Box       then pcall(function() d.Box.Visible = false; d.Box:Remove() end) end
+    if d.Text      then pcall(function() d.Text.Visible = false; d.Text:Remove() end) end
     if d.Highlight then pcall(function() d.Highlight:Destroy() end) end
     ESPStorage[player] = nil
 end
@@ -178,7 +376,15 @@ end
 local function createESP(player)
     if player == LocalPlayer then return end
     removeESP(player)
-    ESPStorage[player] = { Highlight = nil }
+    local box, text
+    if FOVCircle then
+        box = Drawing.new("Square")
+        box.Thickness = 1.5; box.Filled = false; box.Transparency = 1; box.Visible = false
+        text = Drawing.new("Text")
+        text.Size = 14; text.Center = true; text.Outline = true
+        text.OutlineColor = Color3.fromRGB(0, 0, 0); text.Visible = false
+    end
+    ESPStorage[player] = { Box = box, Text = text, Highlight = nil }
 end
 
 local function computeChamsSet()
@@ -242,39 +448,101 @@ local function updateChams(player, chamsSet)
     end
 end
 
+local function updateDrawing2D(player)
+    local d = ESPStorage[player]
+    if not d or not d.Box then return end
+    local espActive = (Settings.ESPMode == "Drawing 2D") or (Settings.ESPMode == "Chams")
+    local char = player.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if espActive and Settings.ESPMode == "Chams" and Settings.ChamsEnemiesOnly and not isEnemy(player) then
+        espActive = false
+    end
+    if not espActive or not (char and hrp and hum and hum.Health > 0) then
+        d.Box.Visible  = false
+        d.Text.Visible = false
+        return
+    end
+    local vec, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+    if not onScreen then
+        d.Box.Visible = false; d.Text.Visible = false; return
+    end
+    local teamColor = getTeamColor(player)
+    local head    = char:FindFirstChild("Head")
+    local headVec = head and Camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.5, 0)) or vec
+    local legVec  = Camera:WorldToViewportPoint(hrp.Position - Vector3.new(0, 3, 0))
+    local height  = math.abs(headVec.Y - legVec.Y)
+    local width   = height / 1.5
+
+    if Settings.ESPMode == "Drawing 2D" then
+        d.Box.Size     = Vector2.new(width, height)
+        d.Box.Position = Vector2.new(vec.X - width / 2, vec.Y - height / 2)
+        d.Box.Color    = teamColor
+        d.Box.Visible  = true
+    else
+        d.Box.Visible = false
+    end
+
+    local info = {}
+    if Settings.ShowName     then info[#info+1] = player.Name end
+    if Settings.ShowTeam     then
+        local role = tostring(player:GetAttribute("Role") or "?"):upper()
+        info[#info+1] = "[" .. role .. "]"
+    end
+    if Settings.ShowHP       then info[#info+1] = "HP " .. math.floor(hum.Health) .. "/" .. math.floor(hum.MaxHealth) end
+    if Settings.ShowDistance then info[#info+1] = math.floor((Camera.CFrame.Position - hrp.Position).Magnitude) .. "m" end
+
+    d.Text.Text     = table.concat(info, " | ")
+    d.Text.Position = Vector2.new(vec.X, vec.Y - (height / 2) - 20)
+    d.Text.Color    = teamColor
+    d.Text.Visible  = true
+end
+
 for _, p in ipairs(Players:GetPlayers()) do
     if p ~= LocalPlayer then createESP(p) end
 end
-Players.PlayerAdded:Connect(createESP)
-Players.PlayerRemoving:Connect(removeESP)
-
--- ------------------------------------------
--- INPUT (PC RMB-hold; mobile = always-on if HoldToAim is off)
--- ------------------------------------------
-local isRMBHeld = false
-UserInputService.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then
-        isRMBHeld = true
-    end
-end)
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then
-        isRMBHeld = false
-    end
-end)
+bindConn(Players.PlayerAdded, createESP)
+bindConn(Players.PlayerRemoving, removeESP)
 
 -- ------------------------------------------
 -- MAIN LOOP
 -- ------------------------------------------
-RunService.RenderStepped:Connect(function()
+bindConn(RunService.RenderStepped, function()
     Camera = Workspace.CurrentCamera or Camera
 
-    local wantAim = Settings.AimbotEnabled
-        and (not Settings.HoldToAim or isRMBHeld)
+    -- FOV + watermark
+    if FOVCircle then
+        local mousePos = UserInputService:GetMouseLocation()
+        local fovVis = Settings.FOVEnabled
+            and Settings.AimbotEnabled
+            and not (Settings.Spinbot or Settings.AutoTarget)
+        FOVCircle.Position = mousePos
+        FOVCircle.Radius   = Settings.FOVRadius
+        FOVCircle.Visible  = fovVis
+
+        if Watermark then
+            if Settings.WatermarkEnabled then
+                Watermark.Visible = true
+                Watermark.Text = string.format(
+                    "Hardcok v3 | Aim:%s(%s) Silent:%s Spin:%s ESP:%s",
+                    Settings.AimbotEnabled and "ON" or "OFF",
+                    Settings.Mode,
+                    Settings.Silent and "ON" or "OFF",
+                    Settings.Spinbot and "ON" or "OFF",
+                    Settings.ESPMode
+                )
+            else
+                Watermark.Visible = false
+            end
+        end
+    end
+
+    -- Aimbot
+    local wantAim = Settings.AimbotEnabled and (isRMBHeld or Settings.AutoTarget or not Settings.HoldToAim)
     if wantAim then
         local target = getClosestTarget()
         if target then
+            DBG.aimFound += 1
             local smoothness = (Settings.Mode == "Rage") and 0.95 or 0.15
             local camPos = Camera.CFrame.Position
             local dir = target.Position - camPos
@@ -284,65 +552,183 @@ RunService.RenderStepped:Connect(function()
                     Camera.CFrame = Camera.CFrame:Lerp(goal, smoothness)
                 end
             end
+            if Settings.AutoShoot and mouse1click then pcall(mouse1click) end
         end
     end
 
+    -- Spinbot
+    if Settings.Spinbot and LocalPlayer.Character then
+        local hrp = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(Settings.SpinSpeed), 0)
+        end
+    end
+
+    -- Silent gate
+    SILENT.v2active = Settings.Silent
+    SILENT.active   = false
+
+    -- ESP pass
     local chamsSet = computeChamsSet()
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LocalPlayer then
             if not ESPStorage[p] then createESP(p) end
             updateChams(p, chamsSet)
+            updateDrawing2D(p)
         end
     end
 end)
 
 -- ------------------------------------------
--- CHAT COMMANDS (works on mobile + PC)
---   ;aim on|off          toggle aimbot
---   ;mode rage|light     change mode
---   ;part head|torso|hrp target part
---   ;esp on|off          toggle chams
---   ;panic               kill everything
---   ;help                show commands
+-- RAYFIELD UI
 -- ------------------------------------------
-local function notify(msg)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title    = "Hardcok Mobile",
-            Text     = msg,
-            Duration = 3,
-        })
-    end)
-    print("[Hardcok] " .. msg)
-end
+local Window = Rayfield:CreateWindow({
+    Name                 = "Universal by Hardcok v3",
+    LoadingTitle         = "Loading...",
+    LoadingSubtitle      = "Merged Edition",
+    ConfigurationSaving  = {
+        Enabled    = true,
+        FolderName = "Hardcok_v3",
+        FileName   = "config",
+    },
+    KeySystem              = false,
+    DisableRayfieldPrompts = true,
+    DisableBuildWarnings   = true,
+})
 
-Players.LocalPlayer.Chatted:Connect(function(msg)
-    msg = msg:lower()
-    if msg == ";aim on" then
-        Settings.AimbotEnabled = true; notify("Aimbot ON")
-    elseif msg == ";aim off" then
-        Settings.AimbotEnabled = false; notify("Aimbot OFF")
-    elseif msg == ";mode rage" then
-        Settings.Mode = "Rage"; notify("Mode: Rage (snap)")
-    elseif msg == ";mode light" then
-        Settings.Mode = "Light"; notify("Mode: Light (smooth)")
-    elseif msg == ";part head" then
-        Settings.TargetPart = "Head"; notify("Target: Head")
-    elseif msg == ";part torso" then
-        Settings.TargetPart = "Torso"; notify("Target: Torso")
-    elseif msg == ";part hrp" then
-        Settings.TargetPart = "HumanoidRootPart"; notify("Target: HRP")
-    elseif msg == ";esp on" then
-        Settings.ESPMode = "Chams"; notify("ESP: Chams")
-    elseif msg == ";esp off" then
-        Settings.ESPMode = "Disabled"; notify("ESP: Off")
-    elseif msg == ";panic" then
+-- === AIM ===
+local AimbotTab = Window:CreateTab("Aim", "crosshair")
+local MasterToggle = AimbotTab:CreateToggle({
+    Name = "Enable Aimbot", CurrentValue = Settings.AimbotEnabled, Flag = "Aimbot",
+    Callback = function(v) Settings.AimbotEnabled = v end,
+})
+AimbotTab:CreateKeybind({
+    Name = "Toggle Aimbot", CurrentKeybind = "X", Flag = "AimbotKey",
+    Callback = function()
+        Settings.AimbotEnabled = not Settings.AimbotEnabled
+        MasterToggle:Set(Settings.AimbotEnabled)
+    end,
+})
+AimbotTab:CreateToggle({
+    Name = "Hold RMB to Aim", CurrentValue = Settings.HoldToAim, Flag = "HoldToAim",
+    Callback = function(v) Settings.HoldToAim = v end,
+})
+AimbotTab:CreateDropdown({
+    Name = "Mode", Options = { "Rage", "Light" }, CurrentOption = { Settings.Mode }, Flag = "AimMode",
+    Callback = function(v) Settings.Mode = type(v) == "table" and v[1] or v end,
+})
+AimbotTab:CreateDropdown({
+    Name = "Target Part", Options = { "Head", "Torso", "HumanoidRootPart" },
+    CurrentOption = { Settings.TargetPart }, Flag = "AimTargetPart",
+    Callback = function(v) Settings.TargetPart = type(v) == "table" and v[1] or v end,
+})
+AimbotTab:CreateToggle({ Name = "Team Check", CurrentValue = Settings.TeamCheck, Flag = "TeamCheck", Callback = function(v) Settings.TeamCheck = v end })
+AimbotTab:CreateToggle({ Name = "Wall Check", CurrentValue = Settings.WallCheck, Flag = "WallCheck", Callback = function(v) Settings.WallCheck = v end })
+AimbotTab:CreateToggle({ Name = "NPC Check",  CurrentValue = Settings.NPCCheck,  Flag = "NPCCheck",  Callback = function(v) Settings.NPCCheck  = v end })
+AimbotTab:CreateLabel("----------")
+local SilentToggle = AimbotTab:CreateToggle({
+    Name = "Silent Aim (bullets bend to nearest)", CurrentValue = Settings.Silent, Flag = "Silent",
+    Callback = function(v) Settings.Silent = v end,
+})
+AimbotTab:CreateLabel("Silent always 360. Works with or without Aimbot.")
+AimbotTab:CreateKeybind({
+    Name = "PANIC (kill everything)", CurrentKeybind = "End", Flag = "PanicKey",
+    Callback = function()
         Settings.AimbotEnabled = false
+        Settings.Silent = false
+        Settings.ClickTP = false
+        Settings.Spinbot = false
+        Settings.AutoShoot = false
         Settings.ESPMode = "Disabled"
-        notify("PANIC — all off")
-    elseif msg == ";help" then
-        notify(";aim ;mode ;part ;esp ;panic ;help")
+        MasterToggle:Set(false)
+        SilentToggle:Set(false)
+        Rayfield:Notify({ Title = "PANIC", Content = "All features disabled.", Duration = 2 })
+    end,
+})
+
+-- === SPINMOD ===
+local SpinTab = Window:CreateTab("Spinmod", "repeat")
+SpinTab:CreateToggle({ Name = "Auto-Target (360 FOV)", CurrentValue = Settings.AutoTarget, Flag = "AutoTarget", Callback = function(v) Settings.AutoTarget = v end })
+SpinTab:CreateToggle({ Name = "Auto-Shoot", CurrentValue = Settings.AutoShoot, Flag = "AutoShoot", Callback = function(v) Settings.AutoShoot = v end })
+SpinTab:CreateToggle({ Name = "Spinbot", CurrentValue = Settings.Spinbot, Flag = "Spinbot", Callback = function(v) Settings.Spinbot = v end })
+SpinTab:CreateSlider({ Name = "Spin Speed", Range = { 10, 360 }, CurrentValue = Settings.SpinSpeed, Increment = 5, Suffix = "°/f", Flag = "SpinSpeed", Callback = function(v) Settings.SpinSpeed = v end })
+
+-- === VISUALS ===
+local VisualsTab = Window:CreateTab("Visuals", "eye")
+VisualsTab:CreateToggle({ Name = "FOV Circle", CurrentValue = Settings.FOVEnabled, Flag = "FOVEnabled", Callback = function(v) Settings.FOVEnabled = v end })
+VisualsTab:CreateSlider({ Name = "FOV Radius", Range = { 30, 400 }, CurrentValue = Settings.FOVRadius, Increment = 5, Suffix = "px", Flag = "FOVRadius", Callback = function(v) Settings.FOVRadius = v end })
+VisualsTab:CreateToggle({ Name = "Watermark HUD", CurrentValue = Settings.WatermarkEnabled, Flag = "Watermark", Callback = function(v) Settings.WatermarkEnabled = v end })
+VisualsTab:CreateToggle({ Name = "Click TP (hold Alt + LMB)", CurrentValue = Settings.ClickTP, Flag = "ClickTP", Callback = function(v) Settings.ClickTP = v end })
+
+-- === ESP ===
+local ESPTab = Window:CreateTab("ESP", "eye")
+ESPTab:CreateDropdown({
+    Name = "ESP Mode", Options = { "Disabled", "Chams", "Drawing 2D" },
+    CurrentOption = { Settings.ESPMode }, Flag = "ESPMode",
+    Callback = function(v) Settings.ESPMode = type(v) == "table" and v[1] or v end,
+})
+ESPTab:CreateToggle({ Name = "Chams: Enemies Only", CurrentValue = Settings.ChamsEnemiesOnly, Flag = "ChamsEnemiesOnly", Callback = function(v) Settings.ChamsEnemiesOnly = v end })
+ESPTab:CreateSlider({ Name = "Chams Max Distance", Range = { 100, 2000 }, CurrentValue = Settings.ChamsMaxDist, Increment = 50, Suffix = "studs", Flag = "ChamsMaxDist", Callback = function(v) Settings.ChamsMaxDist = v end })
+ESPTab:CreateToggle({ Name = "Show Name",     CurrentValue = Settings.ShowName,     Flag = "ShowName",     Callback = function(v) Settings.ShowName = v end })
+ESPTab:CreateToggle({ Name = "Show Distance", CurrentValue = Settings.ShowDistance, Flag = "ShowDistance", Callback = function(v) Settings.ShowDistance = v end })
+ESPTab:CreateToggle({ Name = "Show Role",     CurrentValue = Settings.ShowTeam,     Flag = "ShowTeam",     Callback = function(v) Settings.ShowTeam = v end })
+ESPTab:CreateToggle({ Name = "Show HP",       CurrentValue = Settings.ShowHP,       Flag = "ShowHP",       Callback = function(v) Settings.ShowHP = v end })
+
+-- === CONFIG ===
+local ConfigTab = Window:CreateTab("Config", "save")
+ConfigTab:CreateButton({ Name = "Save Config",   Callback = function() Rayfield:SaveConfiguration(); Rayfield:Notify({Title="Config", Content="Saved.", Duration=2}) end })
+ConfigTab:CreateButton({ Name = "Load Config",   Callback = function() Rayfield:LoadConfiguration(); Rayfield:Notify({Title="Config", Content="Loaded.", Duration=2}) end })
+ConfigTab:CreateButton({ Name = "Reset Config",  Callback = function() Rayfield:ResetConfiguration(); Rayfield:Notify({Title="Config", Content="Reset — restart script.", Duration=3}) end })
+
+-- ------------------------------------------
+-- CONFIG SYNC
+-- ------------------------------------------
+Rayfield:LoadConfiguration()
+task.defer(function()
+    local function pull(flag, cur)
+        local v = Rayfield.GetFlag and Rayfield:GetFlag(flag) or nil
+        if v == nil then return cur end
+        if type(cur) == "boolean" then return (v == true) end
+        if type(cur) == "number"  then return tonumber(v) or cur end
+        if type(cur) == "string"  then return type(v) == "table" and v[1] or v end
+        return v
     end
+    Settings.AimbotEnabled    = pull("Aimbot",          Settings.AimbotEnabled)
+    Settings.Mode             = pull("AimMode",         Settings.Mode)
+    Settings.HoldToAim        = pull("HoldToAim",       Settings.HoldToAim)
+    Settings.TargetPart       = pull("AimTargetPart",   Settings.TargetPart)
+    Settings.TeamCheck        = pull("TeamCheck",       Settings.TeamCheck)
+    Settings.WallCheck        = pull("WallCheck",       Settings.WallCheck)
+    Settings.NPCCheck         = pull("NPCCheck",        Settings.NPCCheck)
+    Settings.Silent           = pull("Silent",          Settings.Silent)
+    Settings.AutoTarget       = pull("AutoTarget",      Settings.AutoTarget)
+    Settings.AutoShoot        = pull("AutoShoot",       Settings.AutoShoot)
+    Settings.Spinbot          = pull("Spinbot",         Settings.Spinbot)
+    Settings.SpinSpeed        = pull("SpinSpeed",       Settings.SpinSpeed)
+    Settings.FOVEnabled       = pull("FOVEnabled",      Settings.FOVEnabled)
+    Settings.FOVRadius        = pull("FOVRadius",       Settings.FOVRadius)
+    Settings.WatermarkEnabled = pull("Watermark",       Settings.WatermarkEnabled)
+    Settings.ClickTP          = pull("ClickTP",         Settings.ClickTP)
+    Settings.ESPMode          = pull("ESPMode",         Settings.ESPMode)
+    Settings.ChamsEnemiesOnly = pull("ChamsEnemiesOnly",Settings.ChamsEnemiesOnly)
+    Settings.ChamsMaxDist     = pull("ChamsMaxDist",    Settings.ChamsMaxDist)
+    Settings.ShowName         = pull("ShowName",        Settings.ShowName)
+    Settings.ShowDistance     = pull("ShowDistance",    Settings.ShowDistance)
+    Settings.ShowTeam         = pull("ShowTeam",        Settings.ShowTeam)
+    Settings.ShowHP           = pull("ShowHP",          Settings.ShowHP)
 end)
 
-notify("Hardcok Mobile loaded — type ;help")
+Rayfield:Notify({ Title = "Hardcok v3 loaded", Content = "Merged — aimbot + ESP + silent + click TP", Duration = 4 })
+
+-- ------------------------------------------
+-- TEARDOWN (live-reload safe)
+-- ------------------------------------------
+if STATE and STATE.onCleanup then
+    STATE.onCleanup(function()
+        SILENT.v2active = false
+        getgenv().HARDCOK_SILENT.active = false
+        pcall(function() for _, p in ipairs(Players:GetPlayers()) do removeESP(p) end end)
+        pcall(function() Rayfield:Destroy() end)
+        pcall(function() cleardrawcache() end)
+    end)
+end
